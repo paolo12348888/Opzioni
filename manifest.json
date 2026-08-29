@@ -1,0 +1,18 @@
+{
+  "name": "GEX Calculator",
+  "short_name": "GEX Calc",
+  "description": "Calcola regime di mercato e bias direzionale dai flussi dei market maker (GEX, Max Pain, PCR)",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#0d1117",
+  "theme_color": "#0d1117",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
