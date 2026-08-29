@@ -92,6 +92,15 @@ if (!window.matchMedia('(display-mode: standalone)').matches) {
   document.getElementById('installBanner').style.display = 'block';
 }
 
+// Mostra a schermo qualsiasi errore JS, invece di fallire in silenzio
+window.onerror = function (msg, url, line) {
+  const errEl = document.getElementById("error");
+  errEl.textContent = "Errore script (riga " + line + "): " + msg;
+  errEl.style.display = "block";
+  errEl.scrollIntoView({ behavior: "smooth", block: "center" });
+  return true;
+};
+
 const RISK_FREE_RATE = 0.05;
 
 function bsGamma(spot, strike, tYears, iv) {
@@ -197,6 +206,8 @@ function parseCsv(text) {
 }
 
 function calcola() {
+  document.activeElement && document.activeElement.blur(); // chiude la tastiera
+
   const errEl = document.getElementById("error");
   const resEl = document.getElementById("result");
   errEl.style.display = "none";
@@ -230,9 +241,11 @@ function calcola() {
         <table><tr><th>Strike</th><th>GEX</th></tr>${rows}</table>
       </div>
     `;
+    resEl.scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (e) {
     errEl.textContent = e.message;
     errEl.style.display = "block";
+    errEl.scrollIntoView({ behavior: "smooth", block: "center" });
   }
 }
 </script>
