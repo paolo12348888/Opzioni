@@ -1,4 +1,4 @@
-const CACHE_NAME = "gex-calculator-v1";
+const CACHE_NAME = "gex-calculator-v4";
 const ASSETS = ["./index.html", "./manifest.json", "./icon.svg"];
 
 self.addEventListener("install", (event) => {
