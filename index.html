@@ -62,6 +62,18 @@
   .optional-row { display: flex; gap: 8px; }
   .optional-row input { width: 100%; }
   .section-title { font-weight: 700; margin-top: 14px; margin-bottom: 6px; }
+  .chart-summary {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px;
+  }
+  .chart-stat {
+    background: rgba(255,255,255,0.03); border: 1px solid var(--border);
+    border-radius: 10px; padding: 8px 10px;
+  }
+  .chart-stat-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .chart-stat-value { font-size: 15px; font-weight: 700; margin-top: 2px; }
+  .chart-stat-value.pos { color: var(--green); }
+  .chart-stat-value.neg { color: var(--red); }
+  .chart-stat-sub { font-size: 10px; color: var(--muted); margin-top: 1px; }
 </style>
 </head>
 <body>
@@ -300,6 +312,132 @@ function buildPerStrikeTable(options, spot) {
     .sort((a, b) => a.strike - b.strike);
 }
 
+function buildStrikeProfile(options, spot) {
+  const byStrike = {};
+  for (const o of options) {
+    const t = o.days_to_expiry / 365;
+    const gamma = bsGamma(spot, o.strike, t, o.implied_vol);
+    const contrib = gamma * o.open_interest * 100 * spot ** 2 * 0.01;
+    if (!byStrike[o.strike]) byStrike[o.strike] = { strike: o.strike, call: 0, put: 0, callOi: 0, putOi: 0 };
+    if (o.option_type === "call") {
+      byStrike[o.strike].call += contrib;
+      byStrike[o.strike].callOi += o.open_interest;
+    } else {
+      byStrike[o.strike].put -= contrib; // negativo, per convenzione put = sotto lo zero
+      byStrike[o.strike].putOi += o.open_interest;
+    }
+  }
+  return Object.values(byStrike).sort((a, b) => a.strike - b.strike);
+}
+
+function fmtBig(n) {
+  const abs = Math.abs(n);
+  const sign = n < 0 ? "-" : "";
+  if (abs >= 1e9) return sign + "$" + (abs / 1e9).toFixed(1) + "B";
+  if (abs >= 1e6) return sign + "$" + (abs / 1e6).toFixed(1) + "M";
+  if (abs >= 1e3) return sign + "$" + (abs / 1e3).toFixed(1) + "K";
+  return sign + "$" + abs.toFixed(0);
+}
+
+function fmtOi(n) {
+  return Math.round(n).toLocaleString("it-IT") + " OI";
+}
+
+function renderStrikeProfileChart(profile, spot, flip) {
+  const callTotal = profile.reduce((s, p) => s + p.call, 0);
+  const putTotal = profile.reduce((s, p) => s + p.put, 0);
+  const netTotal = callTotal + putTotal;
+  const totalGex = Math.abs(callTotal) + Math.abs(putTotal);
+  const totalOi = profile.reduce((s, p) => s + p.callOi + p.putOi, 0);
+  const ratio = totalGex ? Math.abs(netTotal) / totalGex : 0;
+
+  let callWall = null, putWall = null;
+  for (const p of profile) {
+    if (p.call > 0 && (callWall === null || p.call > callWall.call)) callWall = p;
+    if (p.put < 0 && (putWall === null || p.put < putWall.put)) putWall = p;
+  }
+
+  const callWallPct = callWall ? ((callWall.strike - spot) / spot * 100) : null;
+  const putWallPct = putWall ? ((putWall.strike - spot) / spot * 100) : null;
+
+  const summaryHtml = `
+    <div class="chart-summary">
+      <div class="chart-stat"><div class="chart-stat-label">Spot Price</div><div class="chart-stat-value">${spot.toFixed(2)}</div></div>
+      <div class="chart-stat"><div class="chart-stat-label">Net GEX</div><div class="chart-stat-value ${netTotal >= 0 ? 'pos' : 'neg'}">${fmtBig(netTotal)}</div><div class="chart-stat-sub">Ratio: ${ratio.toFixed(2)}</div></div>
+      <div class="chart-stat"><div class="chart-stat-label">Call GEX</div><div class="chart-stat-value pos">${fmtBig(callTotal)}</div><div class="chart-stat-sub">${fmtOi(profile.reduce((s,p)=>s+p.callOi,0))}</div></div>
+      <div class="chart-stat"><div class="chart-stat-label">Put GEX</div><div class="chart-stat-value neg">${fmtBig(putTotal)}</div><div class="chart-stat-sub">${fmtOi(profile.reduce((s,p)=>s+p.putOi,0))}</div></div>
+      <div class="chart-stat"><div class="chart-stat-label">Total GEX</div><div class="chart-stat-value" style="color:var(--accent)">${fmtBig(totalGex)}</div><div class="chart-stat-sub">${fmtOi(totalOi)}</div></div>
+      <div class="chart-stat"><div class="chart-stat-label">Call Wall</div><div class="chart-stat-value pos">${callWall ? callWall.strike : 'n/d'}</div><div class="chart-stat-sub">${callWallPct !== null ? (callWallPct>=0?'+':'')+callWallPct.toFixed(2)+'%' : ''}</div></div>
+      <div class="chart-stat"><div class="chart-stat-label">Put Wall</div><div class="chart-stat-value neg">${putWall ? putWall.strike : 'n/d'}</div><div class="chart-stat-sub">${putWallPct !== null ? (putWallPct>=0?'+':'')+putWallPct.toFixed(2)+'%' : ''}</div></div>
+      <div class="chart-stat"><div class="chart-stat-label">Zero Gamma</div><div class="chart-stat-value">${flip !== null ? flip.toFixed(2) : 'N/A'}</div></div>
+    </div>
+  `;
+
+  // --- SVG chart ---
+  const W = 360, H = 240, padL = 34, padR = 8, padT = 10, padB = 20;
+  const chartW = W - padL - padR, chartH = H - padT - padB;
+  const strikes = profile.map(p => p.strike);
+  const minK = Math.min(...strikes), maxK = Math.max(...strikes);
+  const maxAbs = Math.max(1, ...profile.map(p => Math.max(p.call, -p.put)));
+  const xScale = (k) => padL + (maxK > minK ? (k - minK) / (maxK - minK) : 0.5) * chartW;
+  const yZero = padT + chartH / 2;
+  const yScale = (v) => yZero - (v / maxAbs) * (chartH / 2);
+  const barW = Math.max(2, chartW / strikes.length * 0.6);
+
+  let bars = "";
+  for (const p of profile) {
+    const x = xScale(p.strike) - barW / 2;
+    if (p.call > 0) {
+      const y = yScale(p.call);
+      const isWall = callWall && p.strike === callWall.strike;
+      bars += `<rect x="${x}" y="${y}" width="${barW}" height="${yZero - y}" fill="var(--green)" ${isWall ? 'stroke="#fff" stroke-width="1.5"' : ''}/>`;
+    }
+    if (p.put < 0) {
+      const y = yZero;
+      const h = yScale(p.put) - yZero;
+      const isWall = putWall && p.strike === putWall.strike;
+      bars += `<rect x="${x}" y="${y}" width="${barW}" height="${h}" fill="var(--red)" ${isWall ? 'stroke="#fff" stroke-width="1.5"' : ''}/>`;
+    }
+  }
+
+  const spotX = xScale(Math.max(minK, Math.min(maxK, spot)));
+  const spotLine = `<line x1="${spotX}" y1="${padT}" x2="${spotX}" y2="${padT + chartH}" stroke="var(--accent)" stroke-width="1" stroke-dasharray="3,3"/>
+    <text x="${spotX}" y="${padT - 2}" font-size="8" fill="var(--accent)" text-anchor="middle">Spot</text>`;
+
+  let flipLine = "";
+  if (flip !== null && flip >= minK && flip <= maxK) {
+    const flipX = xScale(flip);
+    flipLine = `<line x1="${flipX}" y1="${padT}" x2="${flipX}" y2="${padT + chartH}" stroke="#fff" stroke-width="1" stroke-dasharray="2,2" opacity="0.5"/>`;
+  }
+
+  // asse X: alcune etichette di strike (max 6, per non affollare)
+  const step = Math.max(1, Math.ceil(strikes.length / 6));
+  let xLabels = "";
+  for (let i = 0; i < strikes.length; i += step) {
+    const k = strikes[i];
+    xLabels += `<text x="${xScale(k)}" y="${H - 4}" font-size="8" fill="var(--muted)" text-anchor="middle">${k}</text>`;
+  }
+
+  const svg = `
+    <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;background:transparent;">
+      <line x1="${padL}" y1="${yZero}" x2="${W - padR}" y2="${yZero}" stroke="var(--border)" stroke-width="1"/>
+      ${bars}
+      ${spotLine}
+      ${flipLine}
+      ${xLabels}
+    </svg>
+  `;
+
+  return `
+    <div class="card">
+      <div class="section-title">Strike Profile</div>
+      ${summaryHtml}
+      <div style="margin-top:12px;">${svg}</div>
+      <div class="hint" style="margin-top:6px;">Verde = Call Gamma (sopra) · Rosso = Put Gamma (sotto) · bordo bianco = Call Wall / Put Wall · linea tratteggiata blu = Spot · linea tratteggiata bianca = Zero Gamma</div>
+    </div>
+  `;
+}
+
 function buildGammaTable(options, spot) {
   return options.map(o => {
     const t = o.days_to_expiry / 365;
@@ -364,6 +502,7 @@ function calcola() {
     const pcr = computePcr(options, putOverride, callOverride);
     const perStrike = buildPerStrikeTable(options, spot);
     const gammaTable = buildGammaTable(options, spot);
+    const strikeProfile = buildStrikeProfile(options, spot);
     const { regime, notes } = interpret(netGex, spot, flip, maxPain, pcr);
     const warnings = assessDataQuality(options, spot);
 
@@ -389,7 +528,10 @@ function calcola() {
       ? `<div class="warning">⚠️ ${warnings.join("<br><br>")}</div>`
       : "";
 
+    const chartHtml = renderStrikeProfileChart(strikeProfile, spot, flip);
+
     resEl.innerHTML = `
+      ${chartHtml}
       <div class="card">
         <div class="row"><span>Ticker</span><span>${ticker.toUpperCase()}</span></div>
         <div class="row"><span>Spot</span><span>${spot}</span></div>
