@@ -61,6 +61,7 @@
   }
   .optional-row { display: flex; gap: 8px; }
   .optional-row input { width: 100%; }
+  .section-title { font-weight: 700; margin-top: 14px; margin-bottom: 6px; }
 </style>
 </head>
 <body>
@@ -70,8 +71,14 @@
 </div>
 
 <h1>GEX Calculator</h1>
-<div class="sub">Regime di mercato e bias direzionale dai flussi dei market maker (GEX, Max Pain, PCR). Calcolo interamente sul telefono, funziona anche offline. Solo supporto informativo — non un segnale di trading garantito.</div>
+<div class="sub">Regime di mercato e bias direzionale dai flussi dei market maker (GEX, Gamma, Max Pain, PCR). Calcolo interamente sul telefono, funziona anche offline. Solo supporto informativo — non un segnale di trading garantito.</div>
 
+<div class="tabs" style="display:flex;gap:8px;margin-bottom:16px;">
+  <div id="tab-manual" class="tab" style="flex:1;padding:10px;text-align:center;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer;font-size:14px;" onclick="switchTab('manual')">Manuale</div>
+  <div id="tab-auto" class="tab" style="flex:1;padding:10px;text-align:center;border-radius:8px;background:var(--card);border:1px solid var(--border);cursor:pointer;font-size:14px;" onclick="switchTab('auto')">Automatico</div>
+</div>
+
+<div id="panel-manual">
 <label>Ticker</label>
 <input id="ticker" placeholder="es. AAPL">
 
@@ -93,11 +100,87 @@
 <div class="hint">Lascia vuoto per calcolarlo dagli strike sopra (meno preciso se ne hai inseriti pochi)</div>
 
 <button class="primary" onclick="calcola()">Calcola</button>
+</div>
+
+<div id="panel-auto" style="display:none;">
+  <label>Worker URL (il tuo Cloudflare Worker)</label>
+  <input id="workerUrl" placeholder="https://gex-proxy.tuonome.workers.dev">
+  <div class="hint">Configuralo una sola volta, resta salvato nel browser</div>
+
+  <label>Ticker</label>
+  <input id="autoTicker" placeholder="es. AAPL">
+
+  <label>Scadenza (opzionale, formato AAAA-MM-GG)</label>
+  <input id="autoExpiration" placeholder="es. 2026-09-25">
+  <div class="hint">Lascia vuoto per usare la prima scadenza disponibile</div>
+
+  <button class="primary" onclick="fetchAuto()">Scarica dati e calcola</button>
+  <div id="autoStatus" class="hint" style="margin-top:8px;"></div>
+</div>
 
 <div id="error"></div>
 <div id="result"></div>
 
 <script>
+function switchTab(name) {
+  document.getElementById('tab-manual').style.background = name === 'manual' ? 'var(--accent)' : 'var(--card)';
+  document.getElementById('tab-manual').style.color = name === 'manual' ? '#fff' : 'var(--text)';
+  document.getElementById('tab-auto').style.background = name === 'auto' ? 'var(--accent)' : 'var(--card)';
+  document.getElementById('tab-auto').style.color = name === 'auto' ? '#fff' : 'var(--text)';
+  document.getElementById('panel-manual').style.display = name === 'manual' ? 'block' : 'none';
+  document.getElementById('panel-auto').style.display = name === 'auto' ? 'block' : 'none';
+}
+
+// ricorda l'URL del Worker tra una sessione e l'altra
+window.addEventListener('DOMContentLoaded', () => {
+  const saved = localStorage.getItem('gexWorkerUrl');
+  if (saved) document.getElementById('workerUrl').value = saved;
+});
+
+async function fetchAuto() {
+  const statusEl = document.getElementById('autoStatus');
+  const errEl = document.getElementById('error');
+  errEl.style.display = 'none';
+  const workerUrl = document.getElementById('workerUrl').value.trim().replace(/\/$/, '');
+  const ticker = document.getElementById('autoTicker').value.trim();
+  const expiration = document.getElementById('autoExpiration').value.trim();
+
+  if (!workerUrl || !ticker) {
+    statusEl.textContent = '⚠️ Inserisci sia il Worker URL che il ticker.';
+    return;
+  }
+  localStorage.setItem('gexWorkerUrl', workerUrl);
+
+  statusEl.textContent = '⏳ Scaricando dati...';
+  try {
+    let url = `${workerUrl}/?ticker=${encodeURIComponent(ticker)}`;
+    if (expiration) url += `&expiration=${encodeURIComponent(expiration)}`;
+    const resp = await fetch(url);
+    const data = await resp.json();
+    if (!resp.ok || data.error) throw new Error(data.error || 'Errore sconosciuto dal Worker');
+    if (!data.spot || !data.options || !data.options.length) {
+      throw new Error('Il Worker ha risposto ma senza dati utilizzabili (spot o opzioni mancanti). Controlla i log del Worker.');
+    }
+
+    // riempi automaticamente i campi manuali e lancia il calcolo
+    document.getElementById('ticker').value = data.ticker || ticker;
+    document.getElementById('spot').value = data.spot;
+    document.getElementById('csv').value = data.options
+      .map(o => `${o.strike},${o.option_type},${o.open_interest},${o.implied_vol},${o.days_to_expiry}`)
+      .join('\n');
+    document.getElementById('putOiTotal').value = data.put_oi_total || '';
+    document.getElementById('callOiTotal').value = data.call_oi_total || '';
+
+    statusEl.textContent = `✅ Dati scaricati (${data.options.length} righe). Calcolo in corso...`;
+    switchTab('manual');
+    calcola();
+  } catch (e) {
+    statusEl.textContent = '';
+    errEl.textContent = 'Errore fetch automatico: ' + e.message;
+    errEl.style.display = 'block';
+  }
+}
+
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("sw.js").catch(() => {});
 }
@@ -217,6 +300,14 @@ function buildPerStrikeTable(options, spot) {
     .sort((a, b) => a.strike - b.strike);
 }
 
+function buildGammaTable(options, spot) {
+  return options.map(o => {
+    const t = o.days_to_expiry / 365;
+    const gamma = bsGamma(spot, o.strike, t, o.implied_vol);
+    return { strike: o.strike, type: o.option_type, iv: o.implied_vol, gamma };
+  }).sort((a, b) => a.strike - b.strike || a.type.localeCompare(b.type));
+}
+
 function interpret(netGex, spot, flip, maxPain, pcr) {
   const regime = netGex > 0 ? "stabile (range-bound)" : "volatile (mosse amplificate)";
   const notes = [];
@@ -272,11 +363,13 @@ function calcola() {
     const maxPain = computeMaxPain(options);
     const pcr = computePcr(options, putOverride, callOverride);
     const perStrike = buildPerStrikeTable(options, spot);
+    const gammaTable = buildGammaTable(options, spot);
     const { regime, notes } = interpret(netGex, spot, flip, maxPain, pcr);
     const warnings = assessDataQuality(options, spot);
 
     const positive = netGex > 0;
     const rows = perStrike.map(r => `<tr><td>${r.strike}</td><td>${r.gex}</td></tr>`).join("");
+    const gammaRows = gammaTable.map(r => `<tr><td>${r.strike}</td><td>${r.type}</td><td>${(r.iv * 100).toFixed(1)}%</td><td>${r.gamma.toFixed(5)}</td></tr>`).join("");
 
     let breakdownHtml = "";
     const groups = groupByExpiry(options);
@@ -288,10 +381,8 @@ function calcola() {
         return `<tr><td>${dte} giorni</td><td class="regime ${groupPositive ? 'pos' : 'neg'}">${groupGex.toFixed(2)}</td><td>${groupPositive ? 'stabile' : 'volatile'}</td></tr>`;
       }).join("");
       breakdownHtml = `
-        <div style="margin-top:14px;">
-          <div style="font-weight:700;margin-bottom:6px;">Breakdown per scadenza</div>
-          <table><tr><th>Scadenza</th><th>GEX</th><th>Regime</th></tr>${groupRows}</table>
-        </div>`;
+        <div class="section-title">Breakdown per scadenza</div>
+        <table><tr><th>Scadenza</th><th>GEX</th><th>Regime</th></tr>${groupRows}</table>`;
     }
 
     const warningsHtml = warnings.length
@@ -311,7 +402,11 @@ function calcola() {
         <ul class="notes">${notes.map(n => `<li>${n}</li>`).join("")}</ul>
         ${breakdownHtml}
         ${warningsHtml}
-        <table style="margin-top:14px;"><tr><th>Strike</th><th>GEX</th></tr>${rows}</table>
+        <div class="section-title">GEX per strike (Gamma × Open Interest)</div>
+        <table><tr><th>Strike</th><th>GEX</th></tr>${rows}</table>
+        <div class="section-title">Gamma per opzione (dato grezzo, prima dell'OI)</div>
+        <table><tr><th>Strike</th><th>Tipo</th><th>IV</th><th>Gamma</th></tr>${gammaRows}</table>
+        <div class="hint">Il Gamma qui è il valore Black-Scholes puro per una singola opzione a quello strike/IV — più è alto, più velocemente cambia il Delta lì. Il GEX sopra è invece Gamma × Open Interest, cioè il "peso" reale sui market maker.</div>
       </div>
     `;
     resEl.scrollIntoView({ behavior: "smooth", block: "start" });
