@@ -62,9 +62,7 @@
   .optional-row { display: flex; gap: 8px; }
   .optional-row input { width: 100%; }
   .section-title { font-weight: 700; margin-top: 14px; margin-bottom: 6px; }
-  .chart-summary {
-    display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px;
-  }
+  .chart-summary { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px; }
   .chart-stat {
     background: rgba(255,255,255,0.03); border: 1px solid var(--border);
     border-radius: 10px; padding: 8px 10px;
@@ -83,7 +81,7 @@
 </div>
 
 <h1>GEX Calculator</h1>
-<div class="sub">Regime di mercato e bias direzionale dai flussi dei market maker (GEX, Gamma, Max Pain, PCR). Calcolo interamente sul telefono, funziona anche offline. Solo supporto informativo — non un segnale di trading garantito.</div>
+<div class="sub">Regime di mercato, bias direzionale e Delta Exposure dai flussi dei market maker. Calcolo interamente sul telefono, funziona anche offline. Solo supporto informativo — non un segnale di trading garantito.</div>
 
 <div class="tabs" style="display:flex;gap:8px;margin-bottom:16px;">
   <div id="tab-manual" class="tab" style="flex:1;padding:10px;text-align:center;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer;font-size:14px;" onclick="switchTab('manual')">Manuale</div>
@@ -134,6 +132,21 @@
 <div id="result"></div>
 
 <script>
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+}
+if (!window.matchMedia('(display-mode: standalone)').matches) {
+  document.getElementById('installBanner').style.display = 'block';
+}
+
+window.onerror = function (msg, url, line) {
+  const errEl = document.getElementById("error");
+  errEl.textContent = "Errore script (riga " + line + "): " + msg;
+  errEl.style.display = "block";
+  errEl.scrollIntoView({ behavior: "smooth", block: "center" });
+  return true;
+};
+
 function switchTab(name) {
   document.getElementById('tab-manual').style.background = name === 'manual' ? 'var(--accent)' : 'var(--card)';
   document.getElementById('tab-manual').style.color = name === 'manual' ? '#fff' : 'var(--text)';
@@ -143,7 +156,6 @@ function switchTab(name) {
   document.getElementById('panel-auto').style.display = name === 'auto' ? 'block' : 'none';
 }
 
-// ricorda l'URL del Worker tra una sessione e l'altra
 window.addEventListener('DOMContentLoaded', () => {
   const saved = localStorage.getItem('gexWorkerUrl');
   if (saved) document.getElementById('workerUrl').value = saved;
@@ -174,7 +186,6 @@ async function fetchAuto() {
       throw new Error('Il Worker ha risposto ma senza dati utilizzabili (spot o opzioni mancanti). Controlla i log del Worker.');
     }
 
-    // riempi automaticamente i campi manuali e lancia il calcolo
     document.getElementById('ticker').value = data.ticker || ticker;
     document.getElementById('spot').value = data.spot;
     document.getElementById('csv').value = data.options
@@ -193,22 +204,6 @@ async function fetchAuto() {
   }
 }
 
-if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.register("sw.js").catch(() => {});
-}
-if (!window.matchMedia('(display-mode: standalone)').matches) {
-  document.getElementById('installBanner').style.display = 'block';
-}
-
-// Mostra a schermo qualsiasi errore JS, invece di fallire in silenzio
-window.onerror = function (msg, url, line) {
-  const errEl = document.getElementById("error");
-  errEl.textContent = "Errore script (riga " + line + "): " + msg;
-  errEl.style.display = "block";
-  errEl.scrollIntoView({ behavior: "smooth", block: "center" });
-  return true;
-};
-
 const RISK_FREE_RATE = 0.05;
 
 function bsGamma(spot, strike, tYears, iv) {
@@ -218,6 +213,28 @@ function bsGamma(spot, strike, tYears, iv) {
   return pdf / (spot * iv * Math.sqrt(tYears));
 }
 
+// Approssimazione Abramowitz-Stegun della funzione errore, per la CDF normale
+function erf(x) {
+  const sign = x >= 0 ? 1 : -1;
+  x = Math.abs(x);
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741, a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+  const t = 1 / (1 + p * x);
+  const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+  return sign * y;
+}
+
+function normCdf(x) {
+  return 0.5 * (1 + erf(x / Math.sqrt(2)));
+}
+
+// Delta Black-Scholes: N(d1) per le call, N(d1)-1 per le put (gia' negativo di suo)
+function bsDelta(spot, strike, tYears, iv, type) {
+  if (tYears <= 0 || iv <= 0 || spot <= 0 || strike <= 0) return 0;
+  const d1 = (Math.log(spot / strike) + (RISK_FREE_RATE + iv ** 2 / 2) * tYears) / (iv * Math.sqrt(tYears));
+  const nd1 = normCdf(d1);
+  return type === "call" ? nd1 : nd1 - 1;
+}
+
 function computeGexAtSpot(options, hypSpot) {
   let total = 0;
   for (const o of options) {
@@ -225,6 +242,17 @@ function computeGexAtSpot(options, hypSpot) {
     const gamma = bsGamma(hypSpot, o.strike, t, o.implied_vol);
     const contrib = gamma * o.open_interest * 100 * hypSpot ** 2 * 0.01;
     total += o.option_type === "call" ? contrib : -contrib;
+  }
+  return total;
+}
+
+// Delta Exposure netto (in azioni equivalenti) a un dato prezzo ipotetico
+function computeDexAtSpot(options, hypSpot) {
+  let total = 0;
+  for (const o of options) {
+    const t = o.days_to_expiry / 365;
+    const delta = bsDelta(hypSpot, o.strike, t, o.implied_vol, o.option_type);
+    total += delta * o.open_interest * 100; // gia' con segno corretto (put negativo di suo)
   }
   return total;
 }
@@ -276,7 +304,7 @@ function assessDataQuality(options, spot) {
   const strikes = [...new Set(options.map(o => o.strike))];
   const warnings = [];
   if (strikes.length < 6) {
-    warnings.push(`Solo ${strikes.length} strike inseriti: Net GEX e Max Pain sono indicativi ma parziali. Per lo Zero Gamma Flip e un PCR affidabile servono più strike (idealmente l'intera chain intorno allo spot).`);
+    warnings.push(`Solo ${strikes.length} strike inseriti: Net GEX e Max Pain sono indicativi ma parziali. Per lo Zero Gamma Flip, il DEX e un PCR affidabile servono più strike (idealmente l'intera chain intorno allo spot).`);
   }
   const range = (Math.max(...strikes) - Math.min(...strikes)) / spot;
   if (range < 0.05) {
@@ -298,20 +326,6 @@ function groupByExpiry(options) {
   return groups;
 }
 
-function buildPerStrikeTable(options, spot) {
-  const byStrike = {};
-  for (const o of options) {
-    const t = o.days_to_expiry / 365;
-    const gamma = bsGamma(spot, o.strike, t, o.implied_vol);
-    let contrib = gamma * o.open_interest * 100 * spot ** 2 * 0.01;
-    contrib = o.option_type === "call" ? contrib : -contrib;
-    byStrike[o.strike] = (byStrike[o.strike] || 0) + contrib;
-  }
-  return Object.entries(byStrike)
-    .map(([k, v]) => ({ strike: parseFloat(k), gex: Math.round(v * 100) / 100 }))
-    .sort((a, b) => a.strike - b.strike);
-}
-
 function buildStrikeProfile(options, spot) {
   const byStrike = {};
   for (const o of options) {
@@ -323,7 +337,7 @@ function buildStrikeProfile(options, spot) {
       byStrike[o.strike].call += contrib;
       byStrike[o.strike].callOi += o.open_interest;
     } else {
-      byStrike[o.strike].put -= contrib; // negativo, per convenzione put = sotto lo zero
+      byStrike[o.strike].put -= contrib;
       byStrike[o.strike].putOi += o.open_interest;
     }
   }
@@ -341,6 +355,14 @@ function fmtBig(n) {
 
 function fmtOi(n) {
   return Math.round(n).toLocaleString("it-IT") + " OI";
+}
+
+function fmtShares(n) {
+  const abs = Math.abs(n);
+  const sign = n < 0 ? "-" : "";
+  if (abs >= 1e6) return sign + (abs / 1e6).toFixed(2) + "M az.";
+  if (abs >= 1e3) return sign + (abs / 1e3).toFixed(1) + "K az.";
+  return sign + abs.toFixed(0) + " az.";
 }
 
 function renderStrikeProfileChart(profile, spot, flip) {
@@ -373,7 +395,6 @@ function renderStrikeProfileChart(profile, spot, flip) {
     </div>
   `;
 
-  // --- SVG chart ---
   const W = 360, H = 240, padL = 34, padR = 8, padT = 10, padB = 20;
   const chartW = W - padL - padR, chartH = H - padT - padB;
   const strikes = profile.map(p => p.strike);
@@ -410,7 +431,6 @@ function renderStrikeProfileChart(profile, spot, flip) {
     flipLine = `<line x1="${flipX}" y1="${padT}" x2="${flipX}" y2="${padT + chartH}" stroke="#fff" stroke-width="1" stroke-dasharray="2,2" opacity="0.5"/>`;
   }
 
-  // asse X: alcune etichette di strike (max 6, per non affollare)
   const step = Math.max(1, Math.ceil(strikes.length / 6));
   let xLabels = "";
   for (let i = 0; i < strikes.length; i += step) {
@@ -428,12 +448,69 @@ function renderStrikeProfileChart(profile, spot, flip) {
     </svg>
   `;
 
+  return {
+    html: `
+      <div class="card">
+        <div class="section-title">Strike Profile</div>
+        ${summaryHtml}
+        <div style="margin-top:12px;">${svg}</div>
+        <div class="hint" style="margin-top:6px;">Verde = Call Gamma (sopra) · Rosso = Put Gamma (sotto) · bordo bianco = Call Wall / Put Wall · linea tratteggiata blu = Spot · linea tratteggiata bianca = Zero Gamma</div>
+      </div>
+    `,
+    callWall: callWall ? callWall.strike : null,
+    putWall: putWall ? putWall.strike : null,
+  };
+}
+
+function renderDexSection(options, spot, flip, callWallStrike, putWallStrike) {
+  const dexAtSpot = computeDexAtSpot(options, spot);
+  const dexDollarAtSpot = dexAtSpot * spot;
+
+  let callDex = 0, putDex = 0;
+  for (const o of options) {
+    const t = o.days_to_expiry / 365;
+    const delta = bsDelta(spot, o.strike, t, o.implied_vol, o.option_type);
+    const contrib = delta * o.open_interest * 100;
+    if (o.option_type === "call") callDex += contrib; else putDex += contrib;
+  }
+
+  const scenarios = [
+    { label: "Spot attuale", price: spot },
+  ];
+  if (flip !== null) scenarios.push({ label: "Zero Gamma Flip", price: flip });
+  if (putWallStrike !== null) scenarios.push({ label: "Put Wall", price: putWallStrike });
+  if (callWallStrike !== null) scenarios.push({ label: "Call Wall", price: callWallStrike });
+
+  const rows = scenarios.map(s => {
+    const dex = computeDexAtSpot(options, s.price);
+    const dexDollar = dex * s.price;
+    const diffShares = dex - dexAtSpot;
+    const diffDollar = diffShares * s.price;
+    return { ...s, dex, dexDollar, diffShares, diffDollar };
+  });
+
+  const tableRows = rows.map(r => `
+    <tr>
+      <td>${r.label} (${r.price.toFixed(2)})</td>
+      <td class="${r.dex >= 0 ? '' : ''}" style="color:${r.dex >= 0 ? 'var(--green)' : 'var(--red)'}">${fmtShares(r.dex)}</td>
+      <td>${fmtBig(r.dexDollar)}</td>
+      <td style="color:${r.diffShares >= 0 ? 'var(--green)' : 'var(--red)'}">${r.label === "Spot attuale" ? "—" : fmtShares(r.diffShares)}</td>
+    </tr>
+  `).join("");
+
   return `
     <div class="card">
-      <div class="section-title">Strike Profile</div>
-      ${summaryHtml}
-      <div style="margin-top:12px;">${svg}</div>
-      <div class="hint" style="margin-top:6px;">Verde = Call Gamma (sopra) · Rosso = Put Gamma (sotto) · bordo bianco = Call Wall / Put Wall · linea tratteggiata blu = Spot · linea tratteggiata bianca = Zero Gamma</div>
+      <div class="section-title">Delta Exposure (DEX)</div>
+      <div class="hint">Quante azioni equivalenti i market maker dovrebbero comprare/vendere per riportare a zero la loro esposizione direzionale (Delta), oggi e in alcuni scenari ipotetici.</div>
+      <div class="row"><span>Net Delta a spot</span><span class="regime ${dexAtSpot >= 0 ? 'pos' : 'neg'}">${fmtShares(dexAtSpot)}</span></div>
+      <div class="row"><span>Controvalore ($)</span><span class="regime ${dexDollarAtSpot >= 0 ? 'pos' : 'neg'}">${fmtBig(dexDollarAtSpot)}</span></div>
+      <div class="row"><span>Call Delta / Put Delta</span><span>${fmtShares(callDex)} / ${fmtShares(putDex)}</span></div>
+      <div class="section-title" style="margin-top:14px;font-size:13px;">Cosa succederebbe se il prezzo arrivasse a...</div>
+      <table>
+        <tr><th>Scenario</th><th>Net Delta</th><th>Controvalore</th><th>Copertura extra</th></tr>
+        ${tableRows}
+      </table>
+      <div class="hint" style="margin-top:6px;">"Copertura extra" = quante azioni in più (rispetto ad ora) i MM dovrebbero muovere se il prezzo arrivasse a quel livello — positivo significa acquisti aggiuntivi, negativo vendite aggiuntive.</div>
     </div>
   `;
 }
@@ -444,6 +521,20 @@ function buildGammaTable(options, spot) {
     const gamma = bsGamma(spot, o.strike, t, o.implied_vol);
     return { strike: o.strike, type: o.option_type, iv: o.implied_vol, gamma };
   }).sort((a, b) => a.strike - b.strike || a.type.localeCompare(b.type));
+}
+
+function buildPerStrikeTable(options, spot) {
+  const byStrike = {};
+  for (const o of options) {
+    const t = o.days_to_expiry / 365;
+    const gamma = bsGamma(spot, o.strike, t, o.implied_vol);
+    let contrib = gamma * o.open_interest * 100 * spot ** 2 * 0.01;
+    contrib = o.option_type === "call" ? contrib : -contrib;
+    byStrike[o.strike] = (byStrike[o.strike] || 0) + contrib;
+  }
+  return Object.entries(byStrike)
+    .map(([k, v]) => ({ strike: parseFloat(k), gex: Math.round(v * 100) / 100 }))
+    .sort((a, b) => a.strike - b.strike);
 }
 
 function interpret(netGex, spot, flip, maxPain, pcr) {
@@ -480,7 +571,7 @@ function parseCsv(text) {
 }
 
 function calcola() {
-  document.activeElement && document.activeElement.blur(); // chiude la tastiera
+  document.activeElement && document.activeElement.blur();
 
   const errEl = document.getElementById("error");
   const resEl = document.getElementById("result");
@@ -528,10 +619,12 @@ function calcola() {
       ? `<div class="warning">⚠️ ${warnings.join("<br><br>")}</div>`
       : "";
 
-    const chartHtml = renderStrikeProfileChart(strikeProfile, spot, flip);
+    const chartResult = renderStrikeProfileChart(strikeProfile, spot, flip);
+    const dexHtml = renderDexSection(options, spot, flip, chartResult.callWall, chartResult.putWall);
 
     resEl.innerHTML = `
-      ${chartHtml}
+      ${chartResult.html}
+      ${dexHtml}
       <div class="card">
         <div class="row"><span>Ticker</span><span>${ticker.toUpperCase()}</span></div>
         <div class="row"><span>Spot</span><span>${spot}</span></div>
@@ -548,7 +641,7 @@ function calcola() {
         <table><tr><th>Strike</th><th>GEX</th></tr>${rows}</table>
         <div class="section-title">Gamma per opzione (dato grezzo, prima dell'OI)</div>
         <table><tr><th>Strike</th><th>Tipo</th><th>IV</th><th>Gamma</th></tr>${gammaRows}</table>
-        <div class="hint">Il Gamma qui è il valore Black-Scholes puro per una singola opzione a quello strike/IV — più è alto, più velocemente cambia il Delta lì. Il GEX sopra è invece Gamma × Open Interest, cioè il "peso" reale sui market maker.</div>
+        <div class="hint">Il Gamma qui è il valore Black-Scholes puro per una singola opzione a quello strike/IV. Il GEX sopra è Gamma × Open Interest. Il DEX (sezione dedicata sopra) usa invece il Delta, non il Gamma: ti dice l'esposizione direzionale attuale dei market maker, non la sua velocità di cambiamento.</div>
       </div>
     `;
     resEl.scrollIntoView({ behavior: "smooth", block: "start" });
