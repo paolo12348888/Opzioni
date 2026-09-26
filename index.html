@@ -95,12 +95,12 @@
 <label>Prezzo spot attuale</label>
 <input id="spot" type="number" inputmode="decimal" step="0.01" placeholder="es. 227.50">
 
-<label>Option chain (CSV: strike,tipo,open_interest,iv,giorni_scadenza)</label>
-<textarea id="csv" placeholder="225,call,1200,0.32,14
-225,put,900,0.34,14
-230,call,800,0.30,14
-230,put,1100,0.33,14"></textarea>
-<div class="hint">tipo = call oppure put · iv in decimale (0.32 = 32%) · dati copiati da Barchart / OptionCharts</div>
+<label>Option chain (CSV: strike,tipo,open_interest,iv,giorni_scadenza,volume)</label>
+<textarea id="csv" placeholder="225,call,1200,0.32,14,340
+225,put,900,0.34,14,1200
+230,call,800,0.30,14,50
+230,put,1100,0.33,14,90"></textarea>
+<div class="hint">tipo = call oppure put · iv in decimale (0.32 = 32%) · il volume è opzionale (sesta colonna): se lo includi, l'app ti avvisa quando è insolitamente alto rispetto all'OI di ieri sera, segno che quel livello potrebbe muoversi in chiusura</div>
 
 <label>PCR — override opzionale (dai totali di Barchart, più affidabile della somma sui pochi strike inseriti)</label>
 <div class="optional-row">
@@ -559,15 +559,29 @@ function interpret(netGex, spot, flip, maxPain, pcr) {
 
 function parseCsv(text) {
   return text.trim().split("\n").filter(Boolean).map(line => {
-    const [strike, option_type, open_interest, implied_vol, days_to_expiry] = line.split(",").map(s => s.trim());
+    const parts = line.split(",").map(s => s.trim());
+    const [strike, option_type, open_interest, implied_vol, days_to_expiry, volume] = parts;
     return {
       strike: parseFloat(strike),
       option_type: option_type.toLowerCase(),
       open_interest: parseFloat(open_interest),
       implied_vol: parseFloat(implied_vol),
       days_to_expiry: parseFloat(days_to_expiry),
+      volume: volume !== undefined && volume !== "" ? parseFloat(volume) : null,
     };
   });
+}
+
+function buildVolumeAlerts(options) {
+  const alerts = [];
+  for (const o of options) {
+    if (o.volume === null || o.volume === undefined || isNaN(o.volume)) continue;
+    if (o.open_interest > 0 && o.volume > o.open_interest) {
+      const ratio = o.volume / o.open_interest;
+      alerts.push({ strike: o.strike, type: o.option_type, volume: o.volume, oi: o.open_interest, ratio });
+    }
+  }
+  return alerts.sort((a, b) => b.ratio - a.ratio);
 }
 
 function calcola() {
@@ -596,6 +610,7 @@ function calcola() {
     const strikeProfile = buildStrikeProfile(options, spot);
     const { regime, notes } = interpret(netGex, spot, flip, maxPain, pcr);
     const warnings = assessDataQuality(options, spot);
+    const volumeAlerts = buildVolumeAlerts(options);
 
     const positive = netGex > 0;
     const rows = perStrike.map(r => `<tr><td>${r.strike}</td><td>${r.gex}</td></tr>`).join("");
@@ -619,6 +634,18 @@ function calcola() {
       ? `<div class="warning">⚠️ ${warnings.join("<br><br>")}</div>`
       : "";
 
+    let volumeAlertHtml = "";
+    if (volumeAlerts.length) {
+      const rows = volumeAlerts.slice(0, 8).map(a =>
+        `<tr><td>${a.strike} ${a.type}</td><td>${a.volume}</td><td>${a.oi}</td><td>${a.ratio.toFixed(1)}x</td></tr>`
+      ).join("");
+      volumeAlertHtml = `
+        <div class="warning">
+          ⚠️ <strong>Attività intraday elevata</strong> — questi strike hanno oggi un Volume superiore all'Open Interest di ieri sera. Non sappiamo se sono nuovi contratti (che sposterebbero i livelli calcolati) o chiusure di posizioni esistenti (che li lascerebbero invariati): trattali con più cautela finché l'OI non si aggiorna stasera.
+          <table style="margin-top:8px;"><tr><th>Strike</th><th>Vol.</th><th>OI (ieri)</th><th>Rapporto</th></tr>${rows}</table>
+        </div>`;
+    }
+
     const chartResult = renderStrikeProfileChart(strikeProfile, spot, flip);
     const dexHtml = renderDexSection(options, spot, flip, chartResult.callWall, chartResult.putWall);
 
@@ -637,6 +664,7 @@ function calcola() {
         <ul class="notes">${notes.map(n => `<li>${n}</li>`).join("")}</ul>
         ${breakdownHtml}
         ${warningsHtml}
+        ${volumeAlertHtml}
         <div class="section-title">GEX per strike (Gamma × Open Interest)</div>
         <table><tr><th>Strike</th><th>GEX</th></tr>${rows}</table>
         <div class="section-title">Gamma per opzione (dato grezzo, prima dell'OI)</div>
